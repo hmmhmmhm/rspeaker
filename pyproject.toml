@@ -1,0 +1,14 @@
+[project]
+name = "listener"
+version = "0.1.0"
+description = "macOS 음성 인식 리스너 (SFSpeechRecognizer + PyObjC)"
+requires-python = ">=3.13"
+dependencies = [
+    "pyobjc-core>=12.1",
+    "pyobjc-framework-Cocoa>=12.1",
+    "pyobjc-framework-AVFoundation>=12.1",
+    "edge-tts",
+]
+
+[project.scripts]
+listener = "listener:main"
