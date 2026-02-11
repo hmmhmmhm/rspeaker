@@ -11,6 +11,7 @@ import threading
 import subprocess
 import urllib.request
 import xml.etree.ElementTree as ET
+from abc import ABC, abstractmethod
 
 import edge_tts
 import objc
@@ -73,13 +74,117 @@ NEWS_TRIGGERS = ["오늘 뉴스", "오늘의 뉴스"]
 TIME_TRIGGERS = ["몇 시야", "몇시야", "몇 시 야", "몇시 야"]
 DATE_TRIGGERS = ["몇 일이야", "몇일이야", "며칠이야", "며 칠이야"]
 WEATHER_TRIGGERS = ["오늘 날씨", "날씨 알려 줘", "날씨", "몇 도야"]
+
 NEWS_URL = "https://news.google.com/rss?hl=ko&gl=KR&ceid=KR:ko"
 NEWS_COUNT = 5
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 GEMINI_KEY_PAGE = "https://aistudio.google.com/apikey"
 CONFIG_PATH = os.path.expanduser("~/.listener.json")
+
+# ─── TTS 엔진 설정 ───────────────────────────────────────────────
+# TTS_ENGINE: "edge" 또는 "typecast"
+#   - 환경변수 TTS_ENGINE 으로 설정하거나
+#   - ~/.listener.json 의 "tts_engine" 필드로 설정
+#   - 기본값: "edge"
 EDGE_TTS_VOICE = "ko-KR-SunHiNeural"
+
+# Typecast TTS 설정
+#   - TYPECAST_API_KEY: 환경변수 또는 ~/.listener.json 의 "typecast_api_key"
+#   - TYPECAST_VOICE_ID: 환경변수 또는 ~/.listener.json 의 "typecast_voice_id"
+#   - TYPECAST_MODEL: "ssfm-v30" (기본) 또는 "ssfm-v21"
+TYPECAST_API_KEY_PAGE = "https://typecast.ai/developers/api"
+TYPECAST_DEFAULT_MODEL = "ssfm-v30"
+
+
+# ─── TTS 엔진 추상화 ─────────────────────────────────────────────
+
+class TTSEngine(ABC):
+    """TTS 엔진의 공통 인터페이스"""
+
+    @abstractmethod
+    def speak(self, text: str) -> None:
+        """텍스트를 음성으로 출력합니다."""
+        ...
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """엔진 이름을 반환합니다."""
+        ...
+
+
+class EdgeTTSEngine(TTSEngine):
+    """Microsoft Edge TTS 엔진"""
+
+    def __init__(self, voice: str = EDGE_TTS_VOICE):
+        self.voice = voice
+
+    @property
+    def name(self) -> str:
+        return f"Edge TTS ({self.voice})"
+
+    def speak(self, text: str) -> None:
+        async def _synthesize():
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                tmp_path = f.name
+            communicate = edge_tts.Communicate(text, self.voice)
+            await communicate.save(tmp_path)
+            subprocess.run(["afplay", tmp_path])
+            os.unlink(tmp_path)
+
+        asyncio.run(_synthesize())
+
+
+class TypecastTTSEngine(TTSEngine):
+    """Typecast TTS 엔진 (typecast-python SDK 사용)"""
+
+    def __init__(self, api_key: str, voice_id: str, model: str = TYPECAST_DEFAULT_MODEL):
+        from typecast import Typecast
+
+        self.voice_id = voice_id
+        self.model = model
+        self.client = Typecast(api_key=api_key)
+
+    @property
+    def name(self) -> str:
+        return f"Typecast TTS ({self.voice_id}, {self.model})"
+
+    def speak(self, text: str) -> None:
+        from typecast.models import TTSRequest, Output
+
+        request = TTSRequest(
+            text=text,
+            voice_id=self.voice_id,
+            model=self.model,
+            language="kor",
+            output=Output(audio_format="mp3"),
+        )
+        response = self.client.text_to_speech(request)
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            f.write(response.audio_data)
+            tmp_path = f.name
+
+        subprocess.run(["afplay", tmp_path])
+        os.unlink(tmp_path)
+
+
+# 전역 TTS 엔진 인스턴스 (main에서 초기화됨)
+_tts_engine: TTSEngine | None = None
+
+
+def _print_voices(voices, numbered=False):
+    """Typecast 보이스 목록을 포맷팅하여 출력합니다."""
+    print("  ┌─ Typecast 보이스 목록 ─────────────────────────")
+    for i, v in enumerate(voices, 1):
+        models = ", ".join(m.version for m in v.models) if v.models else "N/A"
+        gender = v.gender.value if v.gender else "?"
+        if numbered:
+            print(f"  │ [{i:3d}] {v.voice_id}  {v.voice_name}  ({gender}, {models})")
+        else:
+            print(f"  │ {v.voice_id}  {v.voice_name}  ({gender}, {models})")
+    print(f"  └─ 총 {len(voices)}개 보이스")
 
 
 def load_config():
@@ -92,6 +197,93 @@ def load_config():
 def save_config(config):
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=2)
+
+
+def ensure_typecast_key():
+    """Typecast API 키와 Voice ID를 확보합니다."""
+    config = load_config()
+    api_key = os.environ.get("TYPECAST_API_KEY", "") or config.get("typecast_api_key", "")
+    voice_id = os.environ.get("TYPECAST_VOICE_ID", "") or config.get("typecast_voice_id", "")
+
+    if not api_key:
+        print(f"\n  TYPECAST_API_KEY가 설정되지 않았습니다.")
+        print(f"  API 키 발급 페이지: {TYPECAST_API_KEY_PAGE}")
+        subprocess.run(["open", TYPECAST_API_KEY_PAGE])
+        api_key = input("  Typecast API Key를 입력하세요: ").strip()
+        if api_key:
+            config["typecast_api_key"] = api_key
+            save_config(config)
+            print(f"  API 키가 {CONFIG_PATH} 에 저장되었습니다.")
+        else:
+            print("  API 키가 입력되지 않았습니다. Edge TTS로 전환합니다.")
+            return None, None
+
+    if not voice_id:
+        print("\n  Typecast Voice ID가 설정되지 않았습니다.")
+        print("  사용 가능한 보이스를 조회합니다...\n")
+        try:
+            from typecast import Typecast
+            temp_client = Typecast(api_key=api_key)
+            voices = temp_client.voices_v2()
+            _print_voices(voices, numbered=True)
+            print()
+            choice = input("  사용할 보이스 번호를 입력하세요 (또는 Voice ID 직접 입력): ").strip()
+            if choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(voices):
+                    voice_id = voices[idx].voice_id
+                    print(f"  선택됨: {voices[idx].voice_name} ({voice_id})")
+                else:
+                    print("  잘못된 번호입니다. Edge TTS로 전환합니다.")
+                    return None, None
+            elif choice:
+                voice_id = choice
+            else:
+                print("  Voice ID가 입력되지 않았습니다. Edge TTS로 전환합니다.")
+                return None, None
+
+            config["typecast_voice_id"] = voice_id
+            save_config(config)
+            print(f"  Voice ID가 {CONFIG_PATH} 에 저장되었습니다.")
+        except Exception as e:
+            print(f"  보이스 목록 조회 실패: {e}")
+            print("  Edge TTS로 전환합니다.")
+            return None, None
+
+    return api_key, voice_id
+
+
+def init_tts_engine(engine_override=None, voice_override=None, model_override=None):
+    """설정에 따라 TTS 엔진을 초기화합니다.
+
+    Args:
+        engine_override: CLI 등에서 전달받은 일회성 엔진 선택 (설정 파일 변경 없음)
+        voice_override: CLI 등에서 전달받은 일회성 Voice ID
+        model_override: CLI 등에서 전달받은 일회성 모델명
+    """
+    global _tts_engine
+
+    config = load_config()
+    engine_name = engine_override or os.environ.get("TTS_ENGINE", "") or config.get("tts_engine", "edge")
+    engine_name = engine_name.lower().strip()
+
+    if engine_name == "typecast":
+        api_key, voice_id = ensure_typecast_key()
+        if voice_override:
+            voice_id = voice_override
+        if api_key and voice_id:
+            model = model_override or os.environ.get("TYPECAST_MODEL", "") or config.get("typecast_model", TYPECAST_DEFAULT_MODEL)
+            try:
+                _tts_engine = TypecastTTSEngine(api_key=api_key, voice_id=voice_id, model=model)
+                print(f"  TTS 엔진: {_tts_engine.name}")
+                return
+            except Exception as e:
+                print(f"  Typecast 초기화 실패: {e}")
+                print("  Edge TTS로 폴백합니다.")
+
+    # 기본값: Edge TTS
+    _tts_engine = EdgeTTSEngine()
+    print(f"  TTS 엔진: {_tts_engine.name}")
 
 
 def ensure_gemini_key():
@@ -313,16 +505,11 @@ def summarize_news_bulk(news_items_with_text):
 
 
 def speak_korean(text):
-
-    async def _synthesize():
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-            tmp_path = f.name
-        communicate = edge_tts.Communicate(text, EDGE_TTS_VOICE)
-        await communicate.save(tmp_path)
-        subprocess.run(["afplay", tmp_path])
-        os.unlink(tmp_path)
-
-    asyncio.run(_synthesize())
+    global _tts_engine
+    if _tts_engine is None:
+        # 폴백: 엔진이 초기화되지 않았으면 Edge TTS 사용
+        _tts_engine = EdgeTTSEngine()
+    _tts_engine.speak(text)
 
 
 def request_authorization():
@@ -464,15 +651,67 @@ def run_listen_session(recognizer, timeout=DEFAULT_TIMEOUT):
 
 
 def main():
-    print("=" * 50)
-    print(f"  '여보게' → {EXTENDED_TIMEOUT}초 연장")
-    print(f"  '~{STOP_SUFFIX}' → 종료")
-    print(f"  '오늘 뉴스' → 뉴스 읽기")
-    print(f"  '몇시야' → 현재 시간")
-    print(f"  '몇일이야' → 오늘 날짜")
-    print(f"  '오늘 날씨' 또는 '몇 도야' → 날씨 정보")
-    print("=" * 50)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="rSpeaker - macOS 음성 인식 비서")
+    parser.add_argument(
+        "--tts",
+        choices=["edge", "typecast"],
+        default=None,
+        help="사용할 TTS 엔진 (edge 또는 typecast, 기본: 설정 파일 값 또는 edge)",
+    )
+    parser.add_argument(
+        "--typecast-voice",
+        default=None,
+        help="Typecast Voice ID (예: tc_672c5f5ce59fac2a48faeaee)",
+    )
+    parser.add_argument(
+        "--typecast-model",
+        default=None,
+        choices=["ssfm-v21", "ssfm-v30"],
+        help="Typecast 모델 (기본: ssfm-v30)",
+    )
+    parser.add_argument(
+        "--list-voices",
+        action="store_true",
+        help="Typecast 사용 가능한 보이스 목록을 출력하고 종료",
+    )
+    args = parser.parse_args()
+
+    # --list-voices 옵션이면 보이스 목록만 출력하고 종료
+    if args.list_voices:
+        config = load_config()
+        api_key = os.environ.get("TYPECAST_API_KEY", "") or config.get("typecast_api_key", "")
+        if not api_key:
+            print("  Typecast API 키가 설정되지 않았습니다.")
+            print(f"  API 키 발급: {TYPECAST_API_KEY_PAGE}")
+            return
+        try:
+            from typecast import Typecast
+            client = Typecast(api_key=api_key)
+            voices = client.voices_v2()
+            print()
+            _print_voices(voices)
+        except Exception as e:
+            print(f"  보이스 목록 조회 실패: {e}")
+        return
+
+    print("=" * 55)
+    print(f"  '여보게'          → {EXTENDED_TIMEOUT}초 연장")
+    print(f"  '~{STOP_SUFFIX}'             → 종료")
+    print(f"  '오늘 뉴스'       → 뉴스 읽기")
+    print(f"  '몇시야'          → 현재 시간")
+    print(f"  '몇일이야'        → 오늘 날짜")
+    print(f"  '오늘 날씨'       → 날씨 정보")
+    print("=" * 55)
     print()
+
+    # TTS 엔진 초기화 (CLI 인자는 일회성 오버라이드, 설정 파일 변경 없음)
+    init_tts_engine(
+        engine_override=args.tts,
+        voice_override=args.typecast_voice,
+        model_override=args.typecast_model,
+    )
 
     ensure_gemini_key()
     request_authorization()
